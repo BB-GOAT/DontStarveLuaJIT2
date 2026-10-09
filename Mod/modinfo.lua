@@ -319,6 +319,19 @@ configuration_options = {
         disabled_value = "auto",
         require_restart = true,
     },
+    {
+        name = "VulkanOverlayCompat",
+        label = translate({ en = "Vulkan Steam Overlay Compat", zh = "Vulkan覆盖层兼容" }),
+        hover = translate({
+            en = "Keep the Steam overlay working under the Vulkan backend by disabling ANGLE's swapchain maintenance1 feature (the overlay's Vulkan layer cannot handle its present-fence path and hangs the renderer). Turn off to restore the old behavior of disabling the overlay layer.",
+            zh = "Vulkan后端下保持Steam覆盖层可用：禁用ANGLE的swapchain maintenance1特性（覆盖层的Vulkan layer无法处理该呈现路径，激活时会导致渲染卡死）。关闭则恢复旧行为（禁用Steam覆盖层layer）。"
+        }),
+        options = toggle,
+        default = true,
+        disabled_value = true,
+        disabled_by = disable_by_non_win,
+        require_restart = true,
+    },
     AddSection(translate({ en = "DebugOptions", zh = "调试选项" })),
     {
         name = "ForceDisableTailCall",

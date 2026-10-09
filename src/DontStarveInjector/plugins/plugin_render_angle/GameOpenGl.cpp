@@ -58,8 +58,18 @@ namespace {
     // enablePrecisionQualifiers: ANGLE's Vulkan backend otherwise emits RelaxedPrecision for
     // mediump/lowp (see ShaderVk.cpp), which lets drivers run DST's shaders at reduced precision.
     constexpr const char *kPrecisionQualifiersFeatureName = "enablePrecisionQualifiers";
-    // Null-terminated payload for EGL_FEATURE_OVERRIDES_DISABLED_ANGLE.
-    constexpr const char *kDisabledFeatureOverrides[] = {kPrecisionQualifiersFeatureName, nullptr};
+    // supportsSwapchainMaintenance1: ANGLE 在驱动支持时默认启用 VK_EXT_swapchain_maintenance1，
+    // 呈现路径带上 present fence（VkSwapchainPresentFenceInfoEXT pNext）与延迟释放交换链。
+    // Steam 覆盖层的 Vulkan layer（SteamOverlayVulkanLayer64.dll）重建 vkQueuePresentKHR 的
+    // 呈现信息链时不支持这些 maintenance1 结构：覆盖层激活（Shift+Tab）后呈现报错，
+    // ANGLE 错误日志路径（std::ostringstream 构造→malloc）在渲染线程上无限阻塞，
+    // 游戏表现为“framebuffer not complete (0x0)”刷屏后无响应（已实测：RTX 3050 +
+    // 610.88 / Vulkan 1.4.341，ANGLE d9fc4a37 挂起转储）。禁用该特性后回到经典呈现
+    // 路径，Steam 覆盖层 layer 可正常工作。
+    constexpr const char *kSwapchainMaintenance1FeatureName = "supportsSwapchainMaintenance1";
+    // Runtime-built null-terminated payload for EGL_FEATURE_OVERRIDES_DISABLED_ANGLE:
+    // precision qualifiers always; swapchain maintenance1 only with overlay compat on.
+    std::vector<const char *> g_disabled_feature_overrides;
 
     HMODULE g_angle_glesv2 = nullptr;
     HMODULE g_angle_egl = nullptr;
@@ -271,6 +281,11 @@ namespace {
         if (!IsVulkanPlatformRequested()) {
             return;
         }
+        // VulkanOverlayCompat（默认开启）：不再禁用 Steam 覆盖层 layer，
+        // 改由禁用 ANGLE 的 swapchain maintenance1 特性避免冲突（见 MyEglGetDisplay）。
+        if (auto *rc = ds::config::current(); rc != nullptr && ds::render_angle::vulkan_overlay_compat(*rc)) {
+            return;
+        }
 
         auto disabled_layers = GetEnvironmentValue("VK_LOADER_LAYERS_DISABLE");
         if (ContainsDisabledLayer(disabled_layers, kSteamOverlayLayerName)) {
@@ -451,7 +466,9 @@ namespace {
         const EGLAttrib platform_attribs[] = {
                 EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
                 EGL_FEATURE_OVERRIDES_DISABLED_ANGLE,
-                reinterpret_cast<EGLAttrib>(kDisabledFeatureOverrides),
+                reinterpret_cast<EGLAttrib>(g_disabled_feature_overrides.empty()
+                                                    ? nullptr
+                                                    : g_disabled_feature_overrides.data()),
                 EGL_NONE};
         auto display = get_platform_display(EGL_PLATFORM_ANGLE_ANGLE,
                                             reinterpret_cast<void *>(native_display),
@@ -461,8 +478,9 @@ namespace {
             return real_get_display(native_display);
         }
 
-        spdlog::info("ANGLE vulkan display requested with feature overrides: {} disabled",
-                     kPrecisionQualifiersFeatureName);
+        spdlog::info("ANGLE vulkan display requested with feature overrides: {} disabled (maintenance1={})",
+                     kPrecisionQualifiersFeatureName,
+                     g_disabled_feature_overrides.size() > 1 ? "disabled" : "kept");
         return display;
     }
 
@@ -709,6 +727,20 @@ DONTSTARVEINJECTOR_GAME_API void InitGameOpenGl() {
 
     if (!EnsureAngleDllsLoaded()) {
         return;
+    }
+    // 构建 EGL 特性禁用载荷：精度限定符始终禁用；覆盖层兼容开启时
+    // 额外禁用 supportsSwapchainMaintenance1（见 kSwapchainMaintenance1FeatureName 注释）。
+    {
+        // has_rc 已在前面上方校验非空；这里重取 current()。
+        auto *rc = ds::config::current();
+        const bool overlay_compat = rc != nullptr && ds::render_angle::vulkan_overlay_compat(*rc);
+        g_disabled_feature_overrides = {kPrecisionQualifiersFeatureName, nullptr};
+        if (overlay_compat) {
+            g_disabled_feature_overrides.back() = kSwapchainMaintenance1FeatureName;
+            g_disabled_feature_overrides.push_back(nullptr);
+        }
+        spdlog::info("ANGLE feature overrides: precision-qualifiers disabled, maintenance1 {}",
+                     overlay_compat ? "disabled (overlay compat)" : "kept");
     }
     EnsureVulkanLayerDisableEnvironment();
     RebindMainModuleAngleImports();

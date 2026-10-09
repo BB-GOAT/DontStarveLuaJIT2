@@ -81,6 +81,19 @@ DS_PLUGIN_MODULE_EXPORT bool ds_plugin_module_init(ds::plugin::PluginHost *host)
                      std::string{ds::config::keys::kAngleBackend}.c_str());
         return false;
     }
+    OptionSchemaEntry compat;
+    compat.key = std::string{ds::config::keys::kVulkanOverlayCompat};
+    compat.type = ConfigValueType::Bool;
+    compat.default_value = ConfigValue::boolean(true);
+    compat.allowed_sources =
+        static_cast<ds::config::ConfigSourceMask>(ds::config::ConfigSource::ModinfoDefault) |
+        static_cast<ds::config::ConfigSourceMask>(ds::config::ConfigSource::SaveFile) |
+        static_cast<ds::config::ConfigSourceMask>(ds::config::ConfigSource::EnvOrCmd);
+    if (!host->register_option_schema(std::move(compat))) {
+        std::fprintf(stderr, "[plugin_render_angle] schema conflict %s\n",
+                     std::string{ds::config::keys::kVulkanOverlayCompat}.c_str());
+        return false;
+    }
         (void) host->register_game_injector_export("DS_LUAJIT_get_render_backend_name", &DS_LUAJIT_get_render_backend_name);
     host->register_plugin(&g_render_angle);
     std::fprintf(stderr, "[plugin_render_angle] module init registered render.angle\n");
