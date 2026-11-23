@@ -7,6 +7,7 @@ on:
   push:
     branches:
       - master
+      - fix/vbpool-fifo-growth
     tags:
       - "*"
   pull_request:
