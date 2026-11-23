@@ -176,3 +176,86 @@ TEST_CASE("test_buffer_name_pool/eviction_on_full") {
 
     REQUIRE_EQ(pool.acquire(TARGET_ARRAY, USAGE_STREAM, kBucket128), fresh);
 }
+
+TEST_CASE("test_buffer_name_pool/repeated_reuse_keeps_fifo_bounded") {
+    BufferNamePool pool;
+    for (size_t i = 0; i < 1000000; ++i) {
+        REQUIRE(pool.release(42u, TARGET_ARRAY, USAGE_STREAM, 128u));
+        REQUIRE_EQ(pool.totalQueued(), 1);
+        REQUIRE_EQ(pool.acquire(TARGET_ARRAY, USAGE_STREAM, 128u), 42u);
+        REQUIRE_EQ(pool.totalQueued(), 0);
+    }
+    REQUIRE_EQ(pool.totalPooled(), 0);
+    REQUIRE_EQ(pool.totalBytes(), 0);
+}
+
+TEST_CASE("test_buffer_name_pool/bucket_evictions_keep_fifo_bounded") {
+    BufferNamePool pool;
+    g_deleted.clear();
+    const uint32_t releases = static_cast<uint32_t>(kPerBucketCap * 100);
+    for (uint32_t name = 1; name <= releases; ++name) {
+        REQUIRE(pool.releaseWithEvict(name, TARGET_ARRAY, USAGE_STREAM, 128u, mockDeleteBuffers));
+        REQUIRE_EQ(pool.totalQueued(), pool.totalPooled());
+        REQUIRE_LE(pool.totalQueued(), kPerBucketCap);
+    }
+    REQUIRE_EQ(g_deleted.size(), releases - kPerBucketCap);
+    pool.drainAll(mockDeleteBuffers);
+    REQUIRE_EQ(pool.totalQueued(), 0);
+    REQUIRE_EQ(g_deleted.size(), releases);
+    std::sort(g_deleted.begin(), g_deleted.end());
+    for (uint32_t name = 1; name <= releases; ++name)
+        REQUIRE_EQ(g_deleted[name - 1], name);
+    REQUIRE(pool.release(42u, TARGET_ARRAY, USAGE_STREAM, 128u));
+    REQUIRE_EQ(pool.acquire(TARGET_ARRAY, USAGE_STREAM, 128u), 42u);
+    REQUIRE_EQ(pool.totalQueued(), 0);
+}
+
+TEST_CASE("test_buffer_name_pool/large_buffer_evicts_until_within_budget") {
+    BufferNamePool pool;
+    g_deleted.clear();
+    const uint32_t oneMB = 1024u * 1024u;
+    const uint32_t smallCount = static_cast<uint32_t>(kBytesCap / oneMB);
+    for (uint32_t name = 1; name <= smallCount; ++name)
+        REQUIRE(pool.release(name, TARGET_ARRAY, USAGE_STREAM, oneMB));
+    REQUIRE(pool.releaseWithEvict(1000u, TARGET_ELEMENT, USAGE_STREAM, 8u * oneMB, mockDeleteBuffers));
+    REQUIRE_EQ(g_deleted.size(), 8);
+    for (uint32_t i = 0; i < 8; ++i)
+        REQUIRE_EQ(g_deleted[i], i + 1);
+    REQUIRE_EQ(pool.totalBytes(), kBytesCap);
+    REQUIRE_EQ(pool.totalQueued(), pool.totalPooled());
+    REQUIRE_EQ(pool.acquire(TARGET_ELEMENT, USAGE_STREAM, 8u * oneMB), 1000u);
+    pool.drainAll(mockDeleteBuffers);
+    REQUIRE_EQ(pool.totalQueued(), 0);
+}
+
+TEST_CASE("test_buffer_name_pool/oversized_buffer_does_not_evict_existing_names") {
+    BufferNamePool pool;
+    g_deleted.clear();
+    REQUIRE(pool.release(42u, TARGET_ARRAY, USAGE_STREAM, 128u));
+    for (const uint32_t size : {static_cast<uint32_t>(kBytesCap + 1), 0xffffffffu}) {
+        REQUIRE_FALSE(pool.releaseWithEvict(99u, TARGET_ARRAY, USAGE_STREAM, size, mockDeleteBuffers));
+        REQUIRE_EQ(pool.totalPooled(), 1);
+        REQUIRE_EQ(pool.totalBytes(), 128);
+        REQUIRE_EQ(pool.totalQueued(), 1);
+        REQUIRE(g_deleted.empty());
+    }
+    REQUIRE_EQ(pool.acquire(TARGET_ARRAY, USAGE_STREAM, 128u), 42u);
+}
+
+TEST_CASE("test_buffer_name_pool/reuse_refreshes_global_eviction_order") {
+    BufferNamePool pool;
+    g_deleted.clear();
+    // 两个半预算缓冲区填满池；复用第一个后，它应当变成最新入池者。
+    const uint32_t halfBudget = static_cast<uint32_t>(kBytesCap / 2);
+    REQUIRE(pool.release(1u, TARGET_ARRAY, USAGE_STREAM, halfBudget));
+    REQUIRE(pool.release(2u, TARGET_ELEMENT, USAGE_STREAM, halfBudget));
+    REQUIRE_EQ(pool.acquire(TARGET_ARRAY, USAGE_STREAM, halfBudget), 1u);
+    REQUIRE(pool.release(1u, TARGET_ARRAY, USAGE_STREAM, halfBudget));
+    REQUIRE(pool.releaseWithEvict(3u, TARGET_ARRAY, USAGE_STREAM, 128u, mockDeleteBuffers));
+    REQUIRE_EQ(g_deleted.size(), 1);
+    REQUIRE_EQ(g_deleted[0], 2u);
+    REQUIRE_EQ(pool.totalQueued(), 2);
+    REQUIRE_EQ(pool.acquire(TARGET_ARRAY, USAGE_STREAM, halfBudget), 1u);
+    REQUIRE_EQ(pool.acquire(TARGET_ARRAY, USAGE_STREAM, 128u), 3u);
+    REQUIRE_EQ(pool.totalQueued(), 0);
+}

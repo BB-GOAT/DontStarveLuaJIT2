@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include <list>
 #include <unordered_map>
 #include <vector>
 
@@ -28,7 +28,17 @@ struct BufferPoolKeyHash {
 };
 
 class BufferNamePool {
+    using Fifo = std::list<std::pair<BufferPoolKey, uint32_t>>;
+    struct PooledName {
+        uint32_t name;
+        Fifo::iterator fifoEntry;
+    };
+
 public:
+    BufferNamePool() = default;
+    // 桶保存 FIFO 迭代器，禁止复制后引用另一个池的队列。
+    BufferNamePool(const BufferNamePool&) = delete;
+    BufferNamePool& operator=(const BufferNamePool&) = delete;
     static constexpr size_t MAX_POOL_SIZE_PER_BUCKET = 128;
     static constexpr size_t MAX_TOTAL_POOLED         = 1024;
     static constexpr size_t MAX_TOTAL_BYTES          = 64u * 1024u * 1024u;
@@ -37,7 +47,9 @@ public:
         const auto key = makeKey(target, usageType, byteSize);
         auto it = pool_.find(key);
         if (it != pool_.end() && !it->second.empty()) {
-            const uint32_t name = it->second.back();
+            const auto entry = it->second.back();
+            const uint32_t name = entry.name;
+            globalFifo_.erase(entry.fifoEntry);
             it->second.pop_back();
             totalPooled_--;
             totalBytes_ -= key.capacityBucket;
@@ -54,13 +66,16 @@ public:
         return releaseWithEvict(name, target, usageType, byteSize, nullptr);
     }
 
-    // Release with eviction: if pool is full, evict oldest name from the largest bucket
-    // and call deleteBuffers on it, making room for the new name.
-    // Returns false only if eviction is impossible (empty pool edge case).
+    // 超限时淘汰当前桶或全局最旧的缓存，直到新缓冲区能放入。
+    // 无删除回调或单个缓冲区超过预算时返回 false，由调用者删除。
     bool releaseWithEvict(uint32_t name, uint32_t target, uint32_t usageType,
                           uint32_t byteSize,
                           void (*deleteBuffers)(uint32_t, const uint32_t*)) {
         const auto key = makeKey(target, usageType, byteSize);
+        if (byteSize > MAX_TOTAL_BYTES || key.capacityBucket > MAX_TOTAL_BYTES) {
+            stats_.evictions++;
+            return false;
+        }
         auto& bucket = pool_[key];
 
         if (bucket.size() >= MAX_POOL_SIZE_PER_BUCKET) {
@@ -68,15 +83,17 @@ public:
                 stats_.evictions++;
                 return false;
             }
-            uint32_t evicted = bucket.front();
+            uint32_t evicted = bucket.front().name;
+            globalFifo_.erase(bucket.front().fifoEntry);
             bucket.erase(bucket.begin());
             totalPooled_--;
             totalBytes_ -= key.capacityBucket;
             deleteBuffers(1, &evicted);
             sideMap_.erase(evicted);
             stats_.evictions++;
-        } else if (totalPooled_ >= MAX_TOTAL_POOLED ||
-                   totalBytes_ + key.capacityBucket > MAX_TOTAL_BYTES) {
+        }
+        while (totalPooled_ >= MAX_TOTAL_POOLED ||
+               totalBytes_ + key.capacityBucket > MAX_TOTAL_BYTES) {
             if (!deleteBuffers) {
                 stats_.evictions++;
                 return false;
@@ -87,10 +104,11 @@ public:
             }
         }
 
-        bucket.push_back(name);
+        // 每个缓存缓冲区只保留一条队列记录；复用或淘汰时同步删除。
+        auto fifoEntry = globalFifo_.insert(globalFifo_.end(), {key, name});
+        bucket.push_back({name, fifoEntry});
         totalPooled_++;
         totalBytes_ += key.capacityBucket;
-        globalFifo_.push_back({key, name});
         stats_.deleteSaved++;
         return true;
     }
@@ -98,7 +116,11 @@ public:
     void drainAll(void (*deleteBuffers)(uint32_t, const uint32_t*)) {
         for (auto& [key, bucket] : pool_) {
             if (!bucket.empty()) {
-                deleteBuffers(static_cast<uint32_t>(bucket.size()), bucket.data());
+                std::vector<uint32_t> names;
+                names.reserve(bucket.size());
+                for (const auto& entry : bucket)
+                    names.push_back(entry.name);
+                deleteBuffers(static_cast<uint32_t>(names.size()), names.data());
             }
         }
         pool_.clear();
@@ -160,6 +182,7 @@ public:
 
     size_t totalPooled() const noexcept { return totalPooled_; }
     size_t totalBytes()  const noexcept { return totalBytes_; }
+    size_t totalQueued() const noexcept { return globalFifo_.size(); }
 
 private:
     bool evictOldest(void (*deleteBuffers)(uint32_t, const uint32_t*)) {
@@ -172,7 +195,8 @@ private:
                 continue;
 
             auto& bucket = it->second;
-            auto nameIt = std::find(bucket.begin(), bucket.end(), name);
+            auto nameIt = std::find_if(bucket.begin(), bucket.end(),
+                                       [name](const PooledName& entry) { return entry.name == name; });
             if (nameIt == bucket.end())
                 continue;
 
@@ -204,9 +228,9 @@ private:
         return {target, usageType, roundUpPow2(byteSize)};
     }
 
-    std::unordered_map<BufferPoolKey, std::vector<uint32_t>, BufferPoolKeyHash> pool_;
+    std::unordered_map<BufferPoolKey, std::vector<PooledName>, BufferPoolKeyHash> pool_;
     std::unordered_map<uint32_t, SideMapEntry> sideMap_;
-    std::deque<std::pair<BufferPoolKey, uint32_t>> globalFifo_;
+    Fifo globalFifo_;
 
     size_t totalPooled_ = 0;
     size_t totalBytes_  = 0;
